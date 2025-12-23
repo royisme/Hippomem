@@ -1,0 +1,15 @@
+{
+  "name": "memlayer",
+  "version": "1.0.0",
+  "description": "3-Layer Memory Service for LLM Agents",
+  "mcpServers": {
+    "memlayer": {
+      "command": "python",
+      "args": ["-m", "memlayer.mcp_server"],
+      "env": {
+        "PYTHONPATH": "${CLAUDE_PLUGIN_ROOT}"
+      }
+    }
+  },
+  "skills": ["./skills/memlayer/SKILL.md"]
+}
