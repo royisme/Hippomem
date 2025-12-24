@@ -6,7 +6,7 @@ from memlayer.models import Scope, EventPayload, EpisodePayload, L2DraftPayload,
 from memlayer.core.ingestion import upsert_event, commit_episode, promote_to_l2, link_memories
 from memlayer.core.retrieval import search_memory, expand_memory
 from memlayer.core.governance import deprecate_memory, forget_memory, gc_sweep, gc_compact
-import subprocess
+from memlayer.core.docker_manager import DockerManager
 
 def load_json(value):
     if value.startswith("@"):
@@ -175,31 +175,27 @@ def doctor(db_path):
     click.echo(json.dumps({"status": "ok", "data": health}))
 
 @cli.group()
-def service():
+def services():
     """Manage external services (FalkorDB)."""
     pass
 
-@service.command('start')
-def service_start():
-    """Start FalkorDB container."""
-    try:
-        # Run docker container
-        cmd = "docker run -d -p 6379:6379 --name memlayer-falkor falkordb/falkordb"
-        subprocess.run(cmd, shell=True, check=True)
-        click.echo(json.dumps({"status": "ok", "message": "FalkorDB started"}))
-    except subprocess.CalledProcessError:
-        click.echo(json.dumps({"status": "error", "message": "Failed to start FalkorDB (Docker required). Check if container name 'memlayer-falkor' already exists."}))
-    except Exception as e:
-        click.echo(json.dumps({"status": "error", "message": str(e)}))
+@services.command('status')
+def services_status():
+    """Check status of FalkorDB container."""
+    status = DockerManager.check_container_status("memlayer-falkor")
+    click.echo(json.dumps({"status": "ok", "container_status": status}))
 
-@service.command('stop')
-def service_stop():
+@services.command('start')
+def services_start():
+    """Start FalkorDB container."""
+    result = DockerManager.start_falkordb()
+    click.echo(json.dumps(result))
+
+@services.command('stop')
+def services_stop():
     """Stop FalkorDB container."""
-    try:
-        subprocess.run("docker stop memlayer-falkor && docker rm memlayer-falkor", shell=True, check=True)
-        click.echo(json.dumps({"status": "ok", "message": "FalkorDB stopped"}))
-    except Exception as e:
-        click.echo(json.dumps({"status": "error", "message": str(e)}))
+    result = DockerManager.stop_falkordb()
+    click.echo(json.dumps(result))
 
 @cli.group()
 def episode():
