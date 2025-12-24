@@ -2,6 +2,10 @@ import sqlite3
 import contextlib
 import os
 from typing import Generator
+try:
+    import sqlite_vec
+except ImportError:
+    sqlite_vec = None
 
 DB_PATH_DEFAULT = os.path.expanduser("~/.local/share/memlayer/memlayer.db")
 
@@ -15,10 +19,24 @@ def get_db_connection(db_path: str = None) -> Generator[sqlite3.Connection, None
         os.makedirs(db_dir, exist_ok=True)
     
     conn = sqlite3.connect(db_path)
+
+    # Load sqlite-vec extension if available
+    # Check if enable_load_extension is available (it might be disabled in some python builds)
+    if sqlite_vec and hasattr(conn, "enable_load_extension"):
+        try:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+             # If loading fails, just continue without vector support
+             pass
+
     conn.row_factory = sqlite3.Row
     try:
         # Enable WAL mode and foreign keys as recommended
-        conn.execute("PRAGMA journal_mode=WAL;")
+        # Note: In-memory DB (:memory:) doesn't support WAL mode persistence, but works for testing.
+        if db_path != ":memory:":
+            conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.execute("PRAGMA busy_timeout=5000;")
@@ -90,6 +108,15 @@ def init_db(db_path: str = None):
                 ttl_seconds INTEGER
             );
         """)
+
+        # Check if embedding column exists (manual migration for now)
+        try:
+             # Try to add column if it doesn't exist
+             conn.execute("ALTER TABLE memory_l1 ADD COLUMN embedding FLOAT[1536]")
+        except sqlite3.OperationalError:
+             # Column likely exists
+             pass
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_l1_scope ON memory_l1 (tenant_id, workspace_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_l1_type_status ON memory_l1 (type, status);")
 
@@ -157,6 +184,13 @@ def init_db(db_path: str = None):
                 last_confirmed_at TEXT NOT NULL
             );
         """)
+
+        try:
+             # Try to add column if it doesn't exist
+             conn.execute("ALTER TABLE memory_l2_nodes ADD COLUMN embedding FLOAT[1536]")
+        except sqlite3.OperationalError:
+             # Column likely exists
+             pass
 
         # Memory L2 Edges
         conn.execute("""

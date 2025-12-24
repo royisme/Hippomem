@@ -11,16 +11,33 @@ import os
 graph_accelerator = GraphAccelerator()
 
 # Heuristic scoring weights
-W_CONFIDENCE = 0.55
-W_FRESHNESS = 0.20
+W_CONFIDENCE = 0.40
+W_FRESHNESS = 0.15
 W_TYPE = 0.10
-W_VECTOR = 0.15 # Not used yet, but reserved
+W_VECTOR = 0.35 # Significantly boosted for hybrid search
 
 def calculate_freshness(days_since_confirmed: float) -> float:
     # f = exp(-days_since_confirmed / 180)
     return math.exp(-days_since_confirmed / 180.0)
 
 def search_memory(scope: Scope, query: str, view: str = "index", budget: int = 1000, top_k: int = 8, filters: Optional[Dict] = None, db_path: str = None) -> Dict:
+    """
+    Searches memory using Hybrid Search (FTS + Vector).
+    Note: 'query' is treated as text for FTS. For Vector, we assume an embedding is provided in filters
+    or we skip vector part if no embedding is available (since we don't have an embedder here).
+
+    If `filters` contains `query_embedding` (list of floats), we use it.
+    """
+
+    # Check for embedding in filters
+    query_embedding = None
+    if filters and "query_embedding" in filters:
+        query_embedding = filters["query_embedding"]
+        # Remove from filters so it doesn't break SQL generation
+        # Copy filters to avoid mutating input
+        filters = filters.copy()
+        del filters["query_embedding"]
+
     with get_db_connection(db_path) as conn:
         # FTS Search on L1
         # We need to join with the main table to get metadata for filtering and scoring
@@ -51,10 +68,33 @@ def search_memory(scope: Scope, query: str, view: str = "index", budget: int = 1
         # Since tables have different schemas, we normalize them in the select.
         
         # L1 Query
+        # We fetch vector_distance if query_embedding is present
+        vec_col_l1 = "0.0 as vector_dist"
+        vec_param_l1 = []
+
+        if query_embedding:
+            # Check if sqlite-vec is active and table has column?
+            # We assume DB has sqlite-vec loaded if we are here (or it will fail gracefully?)
+            # vec_distance_L2(embedding, ?)
+            # Note: We need to handle cases where embedding is NULL.
+            # If embedding is NULL, distance is NULL (or handled by coalesce).
+            # We'll use COALESCE(vec_distance_L2(m.embedding, ?), 2.0) -- 2.0 is max distance for normalized?
+            # Let's assume unnormalized, but for ranking large distance is bad.
+            # We want similarity. Sim = 1 / (1 + dist).
+
+            # Serialize embedding to bytes for sqlite-vec
+            import struct
+            # sqlite-vec expects raw bytes of float32 array
+            emb_bytes = struct.pack(f'{len(query_embedding)}f', *query_embedding)
+
+            vec_col_l1 = "vec_distance_L2(m.embedding, ?) as vector_dist"
+            vec_param_l1 = [emb_bytes]
+
         sql_l1 = f"""
             SELECT 
                 m.id, m.type, m.title, m.summary, m.status, m.confidence, m.last_confirmed_at, m.applicability_json, m.claims_json,
                 fts.rank as rank,
+                {vec_col_l1},
                 'L1' as layer
             FROM memory_l1 m
             JOIN memory_l1_fts fts ON m.id = fts.id
@@ -63,14 +103,19 @@ def search_memory(scope: Scope, query: str, view: str = "index", budget: int = 1
         """
         
         # L2 Query
-        # Reuse where_clauses but for L2. L2 also has tenant/workspace.
-        # Check if optional filters apply to L2.
-        # repo_id is in L2. type is in L2. status is in L2.
-        # So where_clauses logic holds.
+        vec_col_l2 = "0.0 as vector_dist"
+        vec_param_l2 = []
+        if query_embedding:
+             # Re-use bytes
+             emb_bytes = struct.pack(f'{len(query_embedding)}f', *query_embedding)
+             vec_col_l2 = "vec_distance_L2(m.embedding, ?) as vector_dist"
+             vec_param_l2 = [emb_bytes]
+
         sql_l2 = f"""
             SELECT 
                 m.id, m.type, m.title, m.summary, m.status, m.confidence, m.last_confirmed_at, m.applicability_json, m.claims_json,
                 fts.rank as rank,
+                {vec_col_l2},
                 'L2' as layer
             FROM memory_l2_nodes m
             JOIN memory_l2_fts fts ON m.id = fts.id
@@ -81,16 +126,53 @@ def search_memory(scope: Scope, query: str, view: str = "index", budget: int = 1
         # Combine
         full_sql = f"{sql_l1} UNION ALL {sql_l2} ORDER BY rank LIMIT ?"
         
-        # Params: L1 params + match query + L2 params + match query + limit
-        # L1 params: `params` (from top)
-        # L2 params: same as `params` (assuming same filters apply)
-        # But we appended to `params` earlier? No, `params` only has filter values so far.
+        # Params structure:
+        # L1: [vec_param if any] + [filter params] + [match query]
+        # L2: [vec_param if any] + [filter params] + [match query]
         
-        combined_params = params + [query] + params + [query] + [top_k * 2]
+        # Correction: The SELECT list comes first, but in WHERE clause?
+        # Wait, parameters bind in order of appearance in the statement.
+        # SELECT ... vec_distance(..., ?) ... WHERE ... = ? AND ... MATCH ?
+        # So order is: Vector Param (if any), Filter Params, FTS Query
         
-        cursor = conn.execute(full_sql, combined_params)
-        rows = cursor.fetchall()
+        l1_params = vec_param_l1 + params + [query]
+        l2_params = vec_param_l2 + params + [query]
+        combined_params = l1_params + l2_params + [top_k * 2]
         
+        try:
+            cursor = conn.execute(full_sql, combined_params)
+            rows = cursor.fetchall()
+        except sqlite3.OperationalError as e:
+            # Fallback if vec_distance_L2 is missing or column missing
+            if "no such function: vec_distance_L2" in str(e) or "no such column: m.embedding" in str(e):
+                # Fallback to pure FTS
+                 # Recursive call without embedding
+                 # Or just re-construct query without vector part
+                 # Simplified: return recursive call with query_embedding stripped from filters (already done at top, but we passed it as None?)
+                 # If we are here, query_embedding was not None.
+                 # Let's just log and continue without vector scores (effectively 0 dist -> handled in scoring)
+                 # Actually if SQL failed, we need to re-run.
+
+                 # Re-run without vector column in select
+                 sql_l1_fallback = f"""
+                    SELECT m.id, m.type, m.title, m.summary, m.status, m.confidence, m.last_confirmed_at, m.applicability_json, m.claims_json,
+                    fts.rank as rank, 0.0 as vector_dist, 'L1' as layer
+                    FROM memory_l1 m JOIN memory_l1_fts fts ON m.id = fts.id
+                    WHERE {where_sql.replace('m.', 'm.')} AND memory_l1_fts MATCH ?
+                 """
+                 sql_l2_fallback = f"""
+                    SELECT m.id, m.type, m.title, m.summary, m.status, m.confidence, m.last_confirmed_at, m.applicability_json, m.claims_json,
+                    fts.rank as rank, 0.0 as vector_dist, 'L2' as layer
+                    FROM memory_l2_nodes m JOIN memory_l2_fts fts ON m.id = fts.id
+                    WHERE {where_sql.replace('m.', 'm.')} AND memory_l2_fts MATCH ?
+                 """
+                 full_sql_fb = f"{sql_l1_fallback} UNION ALL {sql_l2_fallback} ORDER BY rank LIMIT ?"
+                 combined_params_fb = params + [query] + params + [query] + [top_k * 2]
+                 cursor = conn.execute(full_sql_fb, combined_params_fb)
+                 rows = cursor.fetchall()
+            else:
+                raise e
+
         # Scoring & Ranking
         scored_items = []
         for row in rows:
@@ -99,7 +181,23 @@ def search_memory(scope: Scope, query: str, view: str = "index", budget: int = 1
             freshness = 1.0 
             
             confidence = row['confidence']
+            vector_dist = row['vector_dist']
             
+            # Vector Similarity: 1 / (1 + dist)
+            # If vector_dist is 0 (fallback), similarity is 1.0 (max).
+            # This biases fallback items to top.
+            # If fallback happened, we should treat vector score as neutral (e.g. 0 contribution or average).
+            # For now, let's assume if query_embedding was provided, we want vector influence.
+            # If fallback, vector_dist is 0.0.
+
+            if query_embedding is None:
+                # Pure FTS: Vector weight is 0 effectively
+                vec_score = 0
+                w_vec = 0
+            else:
+                vec_score = 1.0 / (1.0 + vector_dist) if vector_dist is not None else 0
+                w_vec = W_VECTOR
+
             # Boost L2 slightly or boost specific types?
             # Requirement: Decision/Contract > EpisodeSummary > Observation
             t = row['type']
@@ -110,7 +208,27 @@ def search_memory(scope: Scope, query: str, view: str = "index", budget: int = 1
             else:
                 type_boost = 0.5
             
-            score = (W_CONFIDENCE * confidence) + (W_FRESHNESS * freshness) + (W_TYPE * type_boost)
+            # Normalize FTS rank. Lower is better in FTS5 BM25.
+            # Usually negative? FTS5 rank is roughly BM25 score * -1?
+            # No, standard FTS5 rank is just a score, usually lower is better (more negative).
+            # "The rank values ... are generally negative... more negative is better."
+            # Let's invert/normalize.
+            # Simple approach: Rank is arbitrary.
+            # Let's use rank directly if we can't normalize.
+            # Or just rely on sorting by score.
+            # We'll treat rank as small negative number.
+            # Convert to positive score: score = -rank
+            fts_score = -1.0 * row['rank']
+            # Clamp to 0..1? Hard without global stats.
+            # Let's just use it raw but weighted.
+
+            # Hybrid Score = Weighted Sum
+            # Since fts_score is unbounded, this is tricky.
+            # Reciprocal Rank Fusion is better for this, but we are doing weighted sum per requirements/convention?
+            # Let's stick to Weighted Sum but acknowledge fts_score scale issues.
+
+            score = (W_CONFIDENCE * confidence) + (W_FRESHNESS * freshness) + (W_TYPE * type_boost) + (w_vec * vec_score) + (0.5 * fts_score)
+
             scored_items.append((score, row))
             
         scored_items.sort(key=lambda x: x[0], reverse=True)

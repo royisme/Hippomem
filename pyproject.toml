@@ -1,0 +1,28 @@
+[project]
+name = "memlayer"
+version = "0.1.0"
+description = "Memory Layer for AI Agents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp",
+    "click",
+    "pydantic",
+    "pyyaml",
+    "falkordb",
+    "sqlite-vec",
+]
+
+[project.scripts]
+memlayer = "memlayer.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-mock",
+]

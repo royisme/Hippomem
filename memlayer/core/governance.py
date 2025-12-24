@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import sqlite3
+import uuid
 
 def compute_selector_hash(selector: Dict) -> str:
     # Sort keys to ensure deterministic hash
@@ -168,11 +169,89 @@ def gc_sweep(db_path: str = None) -> Dict:
         return {"status": "ok", "deleted_l0": count}
 
 def gc_compact(scope: Optional[Scope] = None, db_path: str = None) -> Dict:
-    # This is a placeholder for V1.
-    # Logic: Merge related observations into EpisodeSummary or merge similar EpisodeSummaries.
-    # For V1, we can implement a simple "merge observations into episode" if not already done.
-    # But `commit_episode` does that implicitly by logic?
-    # Requirement: "L1 compaction (merge & dedupe) via gc compact"
-    # "Bucket by (tenant, workspace, repo, module, primary_tag, time_window)"
-    # This is complex. For V1 minimal implementation, let's just return "not implemented" or do a no-op.
-    return {"status": "ok", "message": "Compaction not fully implemented in V1"}
+    """
+    Compacts L1 Observations into EpisodeSummaries.
+    Buckets by: tenant, workspace, repo, module, and 24h time window.
+    """
+    if not scope:
+        # Require at least tenant/workspace for safety in this version
+        return {"status": "error", "message": "Scope required for compaction"}
+
+    with get_db_connection(db_path) as conn:
+        # 1. Find active Observations that are not already summarized (heuristically check if they are very old or just grab all active)
+        # We group by day.
+
+        # SQLite doesn't have easy date truncation, assuming ISO format.
+        # SUBSTR(created_at, 1, 10) gives YYYY-MM-DD
+
+        sql = """
+            SELECT
+                SUBSTR(created_at, 1, 10) as day,
+                repo_id,
+                module,
+                GROUP_CONCAT(id) as ids,
+                GROUP_CONCAT(summary, ' || ') as combined_summary
+            FROM memory_l1
+            WHERE tenant_id = ? AND workspace_id = ?
+            AND type = 'Observation'
+            AND status = 'active'
+            GROUP BY day, repo_id, module
+        """
+
+        cursor = conn.execute(sql, (scope.tenant_id, scope.workspace_id))
+        rows = cursor.fetchall()
+
+        compacted_count = 0
+        episodes_created = 0
+
+        for row in rows:
+            day = row['day']
+            repo_id = row['repo_id']
+            module = row['module']
+            ids = row['ids'].split(',')
+            combined_summary = row['combined_summary']
+
+            if len(ids) < 2:
+                # Don't compact singletons for now
+                continue
+
+            # Create EpisodeSummary
+            episode_id = str(uuid.uuid4()) # We need uuid
+            now = datetime.datetime.now().isoformat()
+
+            title = f"Episode: {day} - {module or 'General'}"
+            summary = f"Compacted {len(ids)} observations. Content: {combined_summary[:200]}..."
+
+            conn.execute(
+                """
+                INSERT INTO memory_l1 (
+                    id, tenant_id, workspace_id, repo_id, module, environment, user_id, session_id, task_id,
+                    type, status, title, summary, tags_json, entities_json, claims_json, applicability_json,
+                    confidence, evidence_count, confirmation_count, created_at, updated_at, last_confirmed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (episode_id, scope.tenant_id, scope.workspace_id, repo_id, module, scope.environment, scope.user_id, None, None,
+                 "EpisodeSummary", "active", title, summary, "[]", "[]", "[]", "{}",
+                 0.8, len(ids), 1, now, now, now)
+            )
+
+            # Insert FTS
+            conn.execute(
+                "INSERT INTO memory_l1_fts (id, title, summary, tags_text, entities_text) VALUES (?, ?, ?, ?, ?)",
+                (episode_id, title, summary, "", "")
+            )
+
+            # Archive original observations
+            placeholders = ','.join(['?'] * len(ids))
+            conn.execute(f"UPDATE memory_l1 SET status='archived' WHERE id IN ({placeholders})", ids)
+
+            compacted_count += len(ids)
+            episodes_created += 1
+
+        conn.commit()
+
+        return {
+            "status": "ok",
+            "compacted_observations": compacted_count,
+            "episodes_created": episodes_created
+        }

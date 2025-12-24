@@ -28,6 +28,19 @@ def record_idempotency(conn: sqlite3.Connection, tenant_id: str, key: str, resul
 
 def upsert_event(scope: Scope, payload: EventPayload, idempotency_key: str, distill_to_l1: bool = False, db_path: str = None) -> Dict:
     with get_db_connection(db_path) as conn:
+        # Check idempotency table existence before querying (safety for tests that might mock/race)
+        # But actually init_db should have been called.
+        # The issue in tests is that get_db_connection opens a NEW connection to :memory: every time.
+        # :memory: databases are private to the connection.
+        # We need to reuse the connection if db_path is :memory:.
+        # However, db.py's get_db_connection creates a NEW connection.
+
+        # FIX: The tests pass db_path=":memory:", so each call opens a new DB.
+        # We need to support passing an existing connection OR handle :memory: differently.
+        # But for M3 task, I should fix the test logic, not necessarily ingestion code unless I want to support shared memory DBs.
+        # But wait, `upsert_event` takes `db_path` string.
+        # If I want to test this with :memory:, I can't easily unless I use a shared cache file: URI or a file.
+
         existing = check_idempotency(conn, scope.tenant_id, idempotency_key)
         if existing:
             return existing
@@ -78,7 +91,7 @@ def upsert_event(scope: Scope, payload: EventPayload, idempotency_key: str, dist
                 """,
                 (l1_id, scope.tenant_id, scope.workspace_id, scope.repo_id, scope.module, scope.environment, scope.user_id, scope.session_id, scope.task_id,
                  "Observation", "active", title, summary, "[]", "[]", "[]", "{}", 
-                 1.0, 0, 1, now, now, now)
+                 0.5, 1, 1, now, now, now)
             )
             
             # Update FTS
@@ -124,11 +137,17 @@ def commit_episode(scope: Scope, payload: EpisodePayload, idempotency_key: str, 
         now = datetime.datetime.now().isoformat()
         if target_id:
             # Update
+            # Increase confidence with confirmation
+            # Simple logic: 1 - 0.5 * exp(-confirmation_count)
+            # But in SQL we can't easily compute exp.
+            # We can just increment confidence asymptotically towards 1.0.
+            # NewConf = OldConf + (1 - OldConf) * 0.1
             conn.execute(
                 """
                 UPDATE memory_l1 SET 
                     title=?, summary=?, tags_json=?, entities_json=?, claims_json=?, applicability_json=?,
-                    updated_at=?, confirmation_count = confirmation_count + 1, last_confirmed_at=?
+                    updated_at=?, confirmation_count = confirmation_count + 1, last_confirmed_at=?,
+                    confidence = MIN(1.0, confidence + (1.0 - confidence) * 0.1)
                 WHERE id=?
                 """,
                 (payload.title, payload.summary, json.dumps(payload.tags), json.dumps(payload.entities),
@@ -154,7 +173,7 @@ def commit_episode(scope: Scope, payload: EpisodePayload, idempotency_key: str, 
                 (target_id, scope.tenant_id, scope.workspace_id, scope.repo_id, scope.module, scope.environment, scope.user_id, scope.session_id, scope.task_id,
                  "EpisodeSummary", "active", payload.title, payload.summary, json.dumps(payload.tags), json.dumps(payload.entities),
                  json.dumps(payload.claims), json.dumps(payload.applicability), 
-                 1.0, 0, 1, now, now, now)
+                 0.5, 1, 1, now, now, now)
             )
             # Insert FTS
             conn.execute(
