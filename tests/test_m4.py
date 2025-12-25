@@ -5,19 +5,13 @@ import json
 from memlayer.models import Scope, EventPayload
 from memlayer.core.ingestion import upsert_event
 from memlayer.core.retrieval import search_memory
-from memlayer.db import init_db
-
-# Use a temporary file
-DB_PATH = "test_m4.db"
+from memlayer.db import init_db, get_db_connection, apply_migrations
 
 @pytest.fixture
-def db_path():
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    init_db(DB_PATH)
-    yield DB_PATH
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+def db_connection():
+    with get_db_connection(":memory:") as conn:
+        apply_migrations(conn)
+        yield conn
 
 @pytest.fixture
 def scope():
@@ -30,10 +24,10 @@ def scope():
         user_id="u1"
     )
 
-def test_hybrid_search_fallback(scope, db_path):
+def test_hybrid_search_fallback(scope, db_connection):
     # Test that hybrid search works (falls back gracefully) even without embeddings in DB
-    upsert_event(scope, EventPayload(content="test content alpha", source="test"), "id-1", distill_to_l1=True, db_path=db_path)
-    upsert_event(scope, EventPayload(content="test content beta", source="test"), "id-2", distill_to_l1=True, db_path=db_path)
+    upsert_event(scope, EventPayload(content="test content alpha", source="test"), "id-1", distill_to_l1=True, connection=db_connection)
+    upsert_event(scope, EventPayload(content="test content beta", source="test"), "id-2", distill_to_l1=True, connection=db_connection)
 
     # Search with embedding (mock)
     # Since we can't easily populate embeddings without sqlite-vec logic in upsert (which we skipped for now),
@@ -46,22 +40,20 @@ def test_hybrid_search_fallback(scope, db_path):
     embedding = [0.1] * 1536
     filters = {"query_embedding": embedding}
 
-    res = search_memory(scope, "alpha", filters=filters, db_path=db_path)
+    res = search_memory(scope, "alpha", filters=filters, connection=db_connection)
 
     assert res["status"] == "ok"
     assert len(res["items"]) > 0
     assert res["items"][0]["title"] == "Observation: test content alpha"
 
-def test_schema_has_embedding_column(db_path):
+def test_schema_has_embedding_column(db_connection):
     # Verify migration worked
-    conn = sqlite3.connect(db_path)
     # Check L1
-    cursor = conn.execute("PRAGMA table_info(memory_l1)")
+    cursor = db_connection.execute("PRAGMA table_info(memory_l1)")
     cols = [row[1] for row in cursor.fetchall()]
     assert "embedding" in cols
 
     # Check L2
-    cursor = conn.execute("PRAGMA table_info(memory_l2_nodes)")
+    cursor = db_connection.execute("PRAGMA table_info(memory_l2_nodes)")
     cols = [row[1] for row in cursor.fetchall()]
     assert "embedding" in cols
-    conn.close()
