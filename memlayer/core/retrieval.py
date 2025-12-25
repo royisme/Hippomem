@@ -1,6 +1,6 @@
 from typing import List, Dict, Any, Optional, Literal, Tuple, Union
 from memlayer.models import Scope
-from memlayer.db import get_db_connection
+from memlayer.db import get_db_context
 from memlayer.core.graph import GraphAccelerator
 import sqlite3
 import json
@@ -20,7 +20,7 @@ def calculate_freshness(days_since_confirmed: float) -> float:
     # f = exp(-days_since_confirmed / 180)
     return math.exp(-days_since_confirmed / 180.0)
 
-def search_memory(scope: Scope, query: str, view: str = "index", budget: int = 1000, top_k: int = 8, filters: Optional[Dict] = None, db_path: str = None) -> Dict:
+def search_memory(scope: Scope, query: str, view: str = "index", budget: int = 1000, top_k: int = 8, filters: Optional[Dict] = None, db_path: str = None, connection: sqlite3.Connection = None) -> Dict:
     """
     Searches memory using Hybrid Search (FTS + Vector).
     Note: 'query' is treated as text for FTS. For Vector, we assume an embedding is provided in filters
@@ -38,7 +38,7 @@ def search_memory(scope: Scope, query: str, view: str = "index", budget: int = 1
         filters = filters.copy()
         del filters["query_embedding"]
 
-    with get_db_connection(db_path) as conn:
+    with get_db_context(db_path, connection) as conn:
         # FTS Search on L1
         # We need to join with the main table to get metadata for filtering and scoring
         
@@ -237,7 +237,7 @@ def search_memory(scope: Scope, query: str, view: str = "index", budget: int = 1
         # Packaging
         return package_results(top_items, view, budget, conn)
 
-def expand_memory(scope: Scope, seed_id: str, hops: int = 1, view: str = "detail", budget: int = 1000, db_path: str = None) -> Dict:
+def expand_memory(scope: Scope, seed_id: str, hops: int = 1, view: str = "detail", budget: int = 1000, db_path: str = None, connection: sqlite3.Connection = None) -> Dict:
     # Try Accelerator First
     accelerated_result = graph_accelerator.expand(seed_id, hops)
     
@@ -254,7 +254,7 @@ def expand_memory(scope: Scope, seed_id: str, hops: int = 1, view: str = "detail
             
     # Fallback to SQLite if accelerator failed/disabled or returned empty (check logic? No, if it worked, use it. If None, fallback)
     if accelerated_result is None:
-        with get_db_connection(db_path) as conn:
+        with get_db_context(db_path, connection) as conn:
             # Hop 1
             sql = """
                 SELECT to_id, rel FROM memory_l2_edges
@@ -285,7 +285,7 @@ def expand_memory(scope: Scope, seed_id: str, hops: int = 1, view: str = "detail
                         path_info.append({"from": edge['from_id'], "rel": edge['rel'], "to": edge['to_id']})
 
     # Fetch Node Details (Always from SQLite for rich data/evidence)
-    with get_db_connection(db_path) as conn:
+    with get_db_context(db_path, connection) as conn:
         if not node_ids:
             return {"status": "ok", "view": view, "items": [], "truncation": {"truncated": False, "remaining_budget": budget}, "paths": path_info}
 
