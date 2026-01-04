@@ -1,0 +1,53 @@
+{
+  "_comment": "Input: Claude Code 钩子事件与环境变量。",
+  "_comment2": "Output: Claude Code 运行时 Hook 配置。",
+  "_comment3": "Position: Claude Code Hook 设置。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "python",
+        "args": ["hooks/memlayer_hook.py"],
+        "env": {
+          "MEMLAYER_HOOK_EVENT": "SessionStart"
+        }
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "command": "python",
+        "args": ["hooks/memlayer_hook.py"],
+        "env": {
+          "MEMLAYER_HOOK_EVENT": "UserPromptSubmit"
+        }
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "command": "python",
+        "args": ["hooks/memlayer_hook.py"],
+        "env": {
+          "MEMLAYER_HOOK_EVENT": "PostToolUse"
+        }
+      }
+    ],
+    "PreCompact": [
+      {
+        "command": "python",
+        "args": ["hooks/memlayer_hook.py"],
+        "env": {
+          "MEMLAYER_HOOK_EVENT": "PreCompact"
+        }
+      }
+    ],
+    "Stop": [
+      {
+        "command": "python",
+        "args": ["hooks/memlayer_hook.py"],
+        "env": {
+          "MEMLAYER_HOOK_EVENT": "Stop"
+        }
+      }
+    ]
+  }
+}
